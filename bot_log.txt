@@ -1,0 +1,1 @@
+Telegram bot is running... Multi-user mode with one-time fee per token enabled.
