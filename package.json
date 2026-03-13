@@ -1,17 +1,17 @@
 {
-  "name": "silverbackbot",
-  "version": "1.0.0",
+  "name": "silverback-volume-bot",
+  "version": "2.0.0",
   "license": "MIT",
   "type": "commonjs",
   "scripts": {
-    "rebuild": "npm rebuild"
+    "start": "node bot.js"
   },
   "dependencies": {
-    "ethers": "6.13.2",
-    "grammy": "1.30.0",
+    "@solana/spl-token": "0.4.8",
+    "@solana/web3.js": "1.95.3",
+    "bs58": "6.0.0",
     "dotenv": "16.4.5",
-    "@uniswap/v3-sdk": "3.9.2",
-    "@uniswap/sdk-core": "4.0.3",
-    "bs58": "6.0.0"
+    "ethers": "6.13.2",
+    "grammy": "1.30.0"
   }
 }
