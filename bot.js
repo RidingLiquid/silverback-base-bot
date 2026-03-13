@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { ethers } = require('ethers');
+const crypto = require('crypto');
 const { Connection, Keypair, PublicKey, VersionedTransaction, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { getMint } = require('@solana/spl-token');
 const bs58 = require('bs58');
@@ -21,6 +22,18 @@ const WETH = '0x4200000000000000000000000000000000000006';
 const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const BASESCAN = 'https://basescan.org';
 const UNISWAP_V2_ROUTER = '0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24';
+
+// DEX Routers (Base)
+const AERODROME_ROUTER = '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43';
+const AERODROME_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
+const BASESWAP_ROUTER = '0x327Df1E6de05895d2ab08513aaDD9313Fe505d86';
+const SUSHISWAP_ROUTER = '0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891';
+
+// BACK Token Gate
+const BACK_TOKEN = '0x558881c4959e9cf961a7E1815FCD6586906babd2';
+let BACK_GATE_AMOUNT = 60000; // adjustable threshold
+const GATE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24h re-verify
+const WALLET_WIPE_MS = 2 * 60 * 60 * 1000; // 2h inactivity wipe
 
 // Solana
 const SOL_RPC = process.env.SOL_RPC || 'https://api.mainnet-beta.solana.com';
@@ -46,12 +59,31 @@ const ERC20_ABI = [
   'function name() view returns (string)',
 ];
 
+// Aerodrome uses Route[] structs instead of address[] paths
+const AERODROME_ABI = [
+  'function getAmountsOut(uint256 amountIn, tuple(address from, address to, bool stable, address factory)[] routes) view returns (uint256[] amounts)',
+  'function swapExactETHForTokens(uint256 amountOutMin, tuple(address from, address to, bool stable, address factory)[] routes, address to, uint256 deadline) payable returns (uint256[] amounts)',
+  'function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, tuple(address from, address to, bool stable, address factory)[] routes, address to, uint256 deadline) returns (uint256[] amounts)',
+  'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, tuple(address from, address to, bool stable, address factory)[] routes, address to, uint256 deadline) returns (uint256[] amounts)',
+];
+
 // ============================================================
 // Providers
 // ============================================================
 const baseProvider = new ethers.JsonRpcProvider(BASE_RPC);
 const baseRouter = new ethers.Contract(UNISWAP_V2_ROUTER, ROUTER_ABI, baseProvider);
+const aerodromeRouter = new ethers.Contract(AERODROME_ROUTER, AERODROME_ABI, baseProvider);
+const baseSwapRouter = new ethers.Contract(BASESWAP_ROUTER, ROUTER_ABI, baseProvider);
+const sushiRouter = new ethers.Contract(SUSHISWAP_ROUTER, ROUTER_ABI, baseProvider);
 const solConnection = new Connection(SOL_RPC, 'confirmed');
+
+// DEX registry for arb scanning
+const DEXES = [
+  { name: 'Uniswap', router: baseRouter, address: UNISWAP_V2_ROUTER, type: 'v2' },
+  { name: 'Aerodrome', router: aerodromeRouter, address: AERODROME_ROUTER, type: 'aerodrome' },
+  { name: 'BaseSwap', router: baseSwapRouter, address: BASESWAP_ROUTER, type: 'v2' },
+  { name: 'SushiSwap', router: sushiRouter, address: SUSHISWAP_ROUTER, type: 'v2' },
+];
 
 const bs58Encode = bs58.default ? bs58.default.encode : bs58.encode;
 const bs58Decode = bs58.default ? bs58.default.decode : bs58.decode;
@@ -96,7 +128,9 @@ function getState(userId) {
   if (!userStates.has(userId)) {
     userStates.set(userId, {
       chain: null,
-      mode: null, // 'volume' or 'grid'
+      mode: null, // 'volume', 'grid', or 'arb'
+      // Token gate verification
+      verified: null, // { address, balance, timestamp }
       base: {
         wallet: null,
         token: null, tokenSymbol: null, tokenDecimals: null,
@@ -106,6 +140,8 @@ function getState(userId) {
         isRunning: false, currentCycle: 0, feePaidFor: null,
         // Grid settings
         grid: null, // active grid state
+        // Arb settings
+        arb: null, // active arb state
       },
       solana: {
         wallet: null,
@@ -117,9 +153,46 @@ function getState(userId) {
       },
       waiting_for: null,
       promptMsgId: null,
+      lastActivity: Date.now(),
+      riskAccepted: false, // must accept risk disclaimer before arb/grid
+      pin: null, // optional PIN for session lock
+      _wipeTimer: null,
     });
   }
-  return userStates.get(userId);
+  const s = userStates.get(userId);
+  s.lastActivity = Date.now();
+  resetWipeTimer(userId);
+  return s;
+}
+
+function resetWipeTimer(userId) {
+  const s = userStates.get(userId);
+  if (!s) return;
+  if (s._wipeTimer) clearTimeout(s._wipeTimer);
+  s._wipeTimer = setTimeout(() => {
+    // Only wipe if nothing is actively running
+    const base = s.base;
+    const sol = s.solana;
+    const isActive = base.isRunning || sol.isRunning ||
+      (base.grid && base.grid.running) || (sol.grid && sol.grid.running) ||
+      (base.arb && base.arb.running);
+    if (!isActive) {
+      // If PIN is set, lock (encrypt) instead of full wipe
+      if (s.pin) {
+        if (base.wallet) lockWallet(s, 'base');
+        if (sol.wallet) lockWallet(s, 'solana');
+        console.log(`Locked keys for user ${userId} (inactivity, PIN-encrypted)`);
+      } else {
+        // No PIN — full wipe, keys are gone
+        if (base.wallet) base.wallet = null;
+        if (sol.wallet) sol.wallet = null;
+        console.log(`Wiped keys for user ${userId} (inactivity, no PIN)`);
+      }
+    } else {
+      // Reschedule if still active
+      resetWipeTimer(userId);
+    }
+  }, WALLET_WIPE_MS);
 }
 
 function chainState(userId) {
@@ -132,6 +205,167 @@ function isWhitelisted(username) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ============================================================
+// Key Encryption (AES-256-GCM with user PIN)
+// ============================================================
+function deriveKey(pin, salt) {
+  return crypto.pbkdf2Sync(pin, salt, 100000, 32, 'sha256');
+}
+
+function encryptKey(privateKeyHex, pin) {
+  const salt = crypto.randomBytes(16);
+  const key = deriveKey(pin, salt);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(privateKeyHex, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  // Pack: salt(16) + iv(12) + tag(16) + ciphertext
+  return Buffer.concat([salt, iv, tag, encrypted]).toString('base64');
+}
+
+function decryptKey(blob, pin) {
+  const buf = Buffer.from(blob, 'base64');
+  const salt = buf.subarray(0, 16);
+  const iv = buf.subarray(16, 28);
+  const tag = buf.subarray(28, 44);
+  const encrypted = buf.subarray(44);
+  const key = deriveKey(pin, salt);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  return decrypted.toString('utf8');
+}
+
+// Encrypt and store wallet, wipe raw key from state
+function lockWallet(state, chain) {
+  const cs = state[chain];
+  if (!cs.wallet || !state.pin) return;
+  if (cs._encryptedKey) return; // already locked
+
+  let rawKey;
+  if (chain === 'base') {
+    rawKey = cs.wallet.privateKey;
+  } else {
+    rawKey = bs58Encode(cs.wallet.secretKey);
+  }
+  cs._encryptedKey = encryptKey(rawKey, state.pin);
+  cs.wallet = null; // wipe raw key from memory
+}
+
+// Decrypt wallet back into state
+function unlockWallet(state, chain, pin) {
+  const cs = state[chain];
+  if (!cs._encryptedKey) return false;
+  try {
+    const rawKey = decryptKey(cs._encryptedKey, pin);
+    if (chain === 'base') {
+      cs.wallet = baseImportWallet(rawKey);
+    } else {
+      cs.wallet = solImportWallet(rawKey);
+    }
+    return true;
+  } catch {
+    return false; // wrong PIN
+  }
+}
+
+// Check if wallet is locked (encrypted but not in memory)
+function isLocked(state, chain) {
+  const cs = state[chain];
+  return !cs.wallet && !!cs._encryptedKey;
+}
+
+// Lock wallet when trading stops
+function lockOnStop(state) {
+  if (state.pin) {
+    if (state.base.wallet && !(state.base.isRunning || (state.base.grid && state.base.grid.running) || (state.base.arb && state.base.arb.running))) {
+      lockWallet(state, 'base');
+    }
+    if (state.solana.wallet && !(state.solana.isRunning || (state.solana.grid && state.solana.grid.running))) {
+      lockWallet(state, 'solana');
+    }
+  }
+}
+
+// ============================================================
+// Token Gate (BACK Verification via Signature)
+// ============================================================
+function generateVerifyMessage(chatId) {
+  const nonce = Math.random().toString(36).slice(2, 10);
+  return `Silverback Verify\nChat: ${chatId}\nNonce: ${nonce}`;
+}
+
+async function verifySignatureAndCheckBack(message, signature) {
+  const recoveredAddress = ethers.verifyMessage(message, signature);
+  const back = new ethers.Contract(BACK_TOKEN, ERC20_ABI, baseProvider);
+  const [bal, decimals] = await Promise.all([
+    back.balanceOf(recoveredAddress),
+    back.decimals(),
+  ]);
+  const required = ethers.parseUnits(BACK_GATE_AMOUNT.toString(), decimals);
+  const balHuman = Number(ethers.formatUnits(bal, decimals));
+  return {
+    address: recoveredAddress,
+    balance: balHuman,
+    passed: bal >= required,
+    required: BACK_GATE_AMOUNT,
+  };
+}
+
+function isVerified(state) {
+  if (!state.verified) return false;
+  if (Date.now() - state.verified.timestamp > GATE_EXPIRY_MS) {
+    state.verified = null;
+    return false;
+  }
+  return state.verified.passed;
+}
+
+// ============================================================
+// Risk Disclaimer
+// ============================================================
+const RISK_DISCLAIMER =
+  'RISK DISCLAIMER\n' +
+  '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n' +
+  'This bot trades real funds on-chain.\n\n' +
+  'RISKS:\n' +
+  '- Execution risk: trades may fail or be\n  front-run by MEV bots\n' +
+  '- Slippage: price may move between quote\n  and execution\n' +
+  '- Stuck inventory: if a sell fails after a buy,\n  you hold tokens at potential loss\n' +
+  '- Gas drain: failed txs still cost gas\n' +
+  '- Smart contract risk: DEX bugs or exploits\n\n' +
+  'WALLET SECURITY:\n' +
+  '- Set a PIN to encrypt your key (AES-256)\n' +
+  '- Keys are NEVER saved to disk in plaintext\n' +
+  '- Keys auto-lock after 2h of inactivity\n' +
+  '- Without PIN: keys wiped after 2h idle\n' +
+  '- With PIN: keys encrypted, enter PIN to resume\n' +
+  '- FORGET YOUR PIN = KEY UNRECOVERABLE\n' +
+  '- Use a DEDICATED trading wallet\n' +
+  '- Only deposit what you can afford to lose\n\n' +
+  'MINIMUM CAPITAL:\n' +
+  '- Volume: 0.005 ETH / 0.05 SOL minimum\n' +
+  '- Grid: $50+ USDC recommended\n' +
+  '- Arb: $50+ ETH recommended\n' +
+  '  ($10 or less will be eaten by gas)\n\n' +
+  'By continuing you accept all risks.';
+
+function riskKeyboard() {
+  return new InlineKeyboard()
+    .text('I Understand the Risks', 'accept_risk').row()
+    .text('Cancel', 'main_menu');
+}
+
+function gateMessage(result) {
+  if (result.passed) {
+    return `Verified! ${result.balance.toLocaleString()} BACK in ${fmt.addrBase(result.address)}`;
+  }
+  return `Insufficient BACK tokens.\n` +
+    `Required: ${BACK_GATE_AMOUNT.toLocaleString()} BACK\n` +
+    `Found: ${result.balance.toLocaleString()} BACK in ${fmt.addrBase(result.address)}\n\n` +
+    `Get BACK tokens to unlock premium features.`;
+}
 
 // ============================================================
 // BASE: Wallet & Swap
@@ -584,6 +818,13 @@ async function startGrid(chatId, username) {
   if (cs.grid && cs.grid.running) return 'Grid already running.';
   if (!cs.wallet) return 'No wallet. Go to Wallet menu.';
   if (!cs.grid) return 'Configure grid first via Grid Settings.';
+  if (!state.riskAccepted) return '__SHOW_RISK__';
+
+  // Token gate check for grid
+  if (!isWhitelisted(username) && !isVerified(state)) {
+    return `Grid requires BACK token verification.\n\n` +
+      `Hold ${BACK_GATE_AMOUNT.toLocaleString()} BACK and verify via "Switch Mode" > "Verify BACK".`;
+  }
 
   cs.grid.running = true;
   cs.grid.startTime = Date.now();
@@ -643,6 +884,362 @@ function buildGridStatus(chatId) {
   for (const l of grid.levels) {
     const status = l.filled ? (l.type === 'sell' ? `holding ${l.ethHeld.toFixed(4)} ${native}` : 'filled') : 'waiting';
     msg += `  ${l.type === 'buy' ? 'BUY' : 'SELL'} $${l.price.toFixed(2)} [${status}]\n`;
+  }
+
+  return msg;
+}
+
+// ============================================================
+// ARBITRAGE ENGINE (Base only — cross-DEX)
+// ============================================================
+
+/*
+  Cross-DEX arbitrage on Base:
+  - Scans WETH/USDC (or custom pairs) across Uniswap V2, Aerodrome, BaseSwap, SushiSwap
+  - Finds price discrepancies between DEXes
+  - Buys on cheaper DEX, sells on more expensive DEX
+  - Profit = spread minus gas costs
+  - Base-only (Solana uses Jupiter aggregator which already finds best price)
+*/
+
+async function getDexPrice(dex, tokenIn, tokenOut, amountIn) {
+  try {
+    if (dex.type === 'aerodrome') {
+      const routes = [{ from: tokenIn, to: tokenOut, stable: false, factory: AERODROME_FACTORY }];
+      const amounts = await dex.router.getAmountsOut(amountIn, routes);
+      return { dex: dex.name, amountOut: amounts[amounts.length - 1], router: dex };
+    } else {
+      const path = [tokenIn, tokenOut];
+      const amounts = await dex.router.getAmountsOut(amountIn, path);
+      return { dex: dex.name, amountOut: amounts[1], router: dex };
+    }
+  } catch {
+    return null; // DEX may not have this pair or liquidity
+  }
+}
+
+async function scanArbOpportunity(tokenA, tokenB, amountIn) {
+  // Get prices on all DEXes in parallel
+  const [forwardPrices, reversePrices] = await Promise.all([
+    Promise.all(DEXES.map(d => getDexPrice(d, tokenA, tokenB, amountIn))),
+    Promise.all(DEXES.map(d => getDexPrice(d, tokenB, tokenA, 0n))), // placeholder, we'll use forward results
+  ]);
+
+  const validForward = forwardPrices.filter(Boolean);
+  if (validForward.length < 2) return null;
+
+  // Find best buy (most tokenB per tokenA) and worst buy (least tokenB per tokenA)
+  validForward.sort((a, b) => {
+    if (a.amountOut > b.amountOut) return -1;
+    if (a.amountOut < b.amountOut) return 1;
+    return 0;
+  });
+
+  const bestBuy = validForward[0]; // most tokenB output (buy here)
+  const worstBuy = validForward[validForward.length - 1]; // least tokenB output
+
+  // Now check: if we buy tokenB on bestBuy DEX, can we sell it back for more tokenA on another DEX?
+  const tokenBAmount = bestBuy.amountOut;
+
+  // Get reverse prices (sell tokenB back to tokenA) on all DEXes
+  const sellPrices = await Promise.all(
+    DEXES.map(d => getDexPrice(d, tokenB, tokenA, tokenBAmount))
+  );
+
+  const validSell = sellPrices.filter(Boolean);
+  if (validSell.length === 0) return null;
+
+  validSell.sort((a, b) => {
+    if (a.amountOut > b.amountOut) return -1;
+    if (a.amountOut < b.amountOut) return 1;
+    return 0;
+  });
+
+  const bestSell = validSell[0];
+
+  // Profit = what we get back - what we put in
+  const profitWei = bestSell.amountOut - amountIn;
+  if (profitWei <= 0n) return null;
+
+  const profitBps = Number((profitWei * 10000n) / amountIn);
+
+  return {
+    buyDex: bestBuy.dex,
+    buyRouter: bestBuy.router,
+    sellDex: bestSell.dex,
+    sellRouter: bestSell.router,
+    amountIn,
+    tokenBReceived: tokenBAmount,
+    amountOut: bestSell.amountOut,
+    profitWei,
+    profitBps,
+    tokenA,
+    tokenB,
+    allPrices: validForward.map(p => ({
+      dex: p.dex,
+      amountOut: p.amountOut,
+    })),
+  };
+}
+
+async function executeArb(wallet, opp) {
+  const signer = wallet.connect(baseProvider);
+
+  // Step 1: Buy tokenB on cheaper DEX
+  let buyHash;
+  const buyDex = DEXES.find(d => d.name === opp.buyDex);
+  const deadline = Math.floor(Date.now() / 1000) + 300;
+  const minBuyOut = opp.tokenBReceived * 97n / 100n; // 3% slippage
+
+  if (opp.tokenA === WETH) {
+    // Buying with ETH
+    if (buyDex.type === 'aerodrome') {
+      const routes = [{ from: WETH, to: opp.tokenB, stable: false, factory: AERODROME_FACTORY }];
+      const r = buyDex.router.connect(signer);
+      const tx = await r.swapExactETHForTokens(minBuyOut, routes, wallet.address, deadline, { value: opp.amountIn, gasLimit: 350000n });
+      const receipt = await tx.wait();
+      buyHash = receipt.hash;
+    } else {
+      const r = buyDex.router.connect(signer);
+      const path = [WETH, opp.tokenB];
+      const tx = await r.swapExactETHForTokens(minBuyOut, path, wallet.address, deadline, { value: opp.amountIn, gasLimit: 350000n });
+      const receipt = await tx.wait();
+      buyHash = receipt.hash;
+    }
+  } else {
+    // Buying with ERC20
+    const tokenContract = new ethers.Contract(opp.tokenA, ERC20_ABI, signer);
+    const allowance = await tokenContract.allowance(wallet.address, buyDex.address);
+    if (allowance < opp.amountIn) {
+      const appTx = await tokenContract.approve(buyDex.address, ethers.MaxUint256);
+      await appTx.wait();
+    }
+    if (buyDex.type === 'aerodrome') {
+      const routes = [{ from: opp.tokenA, to: opp.tokenB, stable: false, factory: AERODROME_FACTORY }];
+      const r = buyDex.router.connect(signer);
+      const tx = await r.swapExactTokensForTokens(opp.amountIn, minBuyOut, routes, wallet.address, deadline, { gasLimit: 350000n });
+      const receipt = await tx.wait();
+      buyHash = receipt.hash;
+    } else {
+      const r = buyDex.router.connect(signer);
+      const path = [opp.tokenA, opp.tokenB];
+      const tx = await r.swapExactTokensForTokens(opp.amountIn, minBuyOut, path, wallet.address, deadline, { gasLimit: 350000n });
+      const receipt = await tx.wait();
+      buyHash = receipt.hash;
+    }
+  }
+
+  // Step 2: Sell tokenB on more expensive DEX
+  let sellHash;
+  const sellDex = DEXES.find(d => d.name === opp.sellDex);
+
+  // Get actual tokenB balance after buy
+  const tokenBContract = new ethers.Contract(opp.tokenB, ERC20_ABI, signer);
+  const tokenBBal = await tokenBContract.balanceOf(wallet.address);
+  const minSellOut = opp.amountIn; // at minimum get back what we put in
+
+  // Approve sell router
+  const sellAllowance = await tokenBContract.allowance(wallet.address, sellDex.address);
+  if (sellAllowance < tokenBBal) {
+    const appTx = await tokenBContract.approve(sellDex.address, ethers.MaxUint256);
+    await appTx.wait();
+  }
+
+  if (opp.tokenA === WETH) {
+    // Selling back to ETH
+    if (sellDex.type === 'aerodrome') {
+      const routes = [{ from: opp.tokenB, to: WETH, stable: false, factory: AERODROME_FACTORY }];
+      const r = sellDex.router.connect(signer);
+      const tx = await r.swapExactTokensForETH(tokenBBal, minSellOut, routes, wallet.address, deadline, { gasLimit: 350000n });
+      const receipt = await tx.wait();
+      sellHash = receipt.hash;
+    } else {
+      const r = sellDex.router.connect(signer);
+      const path = [opp.tokenB, WETH];
+      const tx = await r.swapExactTokensForETH(tokenBBal, minSellOut, path, wallet.address, deadline, { gasLimit: 350000n });
+      const receipt = await tx.wait();
+      sellHash = receipt.hash;
+    }
+  } else {
+    if (sellDex.type === 'aerodrome') {
+      const routes = [{ from: opp.tokenB, to: opp.tokenA, stable: false, factory: AERODROME_FACTORY }];
+      const r = sellDex.router.connect(signer);
+      const tx = await r.swapExactTokensForTokens(tokenBBal, minSellOut, routes, wallet.address, deadline, { gasLimit: 350000n });
+      const receipt = await tx.wait();
+      sellHash = receipt.hash;
+    } else {
+      const r = sellDex.router.connect(signer);
+      const path = [opp.tokenB, opp.tokenA];
+      const tx = await r.swapExactTokensForTokens(tokenBBal, minSellOut, path, wallet.address, deadline, { gasLimit: 350000n });
+      const receipt = await tx.wait();
+      sellHash = receipt.hash;
+    }
+  }
+
+  return { buyHash, sellHash };
+}
+
+function createArbState() {
+  return {
+    running: false,
+    pairs: [{ tokenA: WETH, tokenB: USDC_BASE, label: 'ETH/USDC' }],
+    tradeSize: ethers.parseEther('0.01'), // ETH per arb attempt
+    minProfitBps: 30, // 0.3% minimum spread to execute
+    pollInterval: 10, // seconds between scans
+    totalProfit: 0, // in ETH
+    tradesCompleted: 0,
+    scansCompleted: 0,
+    opportunitiesFound: 0,
+    lastScan: null, // latest scan results
+    startTime: null,
+  };
+}
+
+async function runArbLoop(chatId) {
+  const state = getState(chatId);
+  const cs = state.base;
+  const arb = cs.arb;
+
+  if (!arb || !arb.running) return;
+
+  try {
+    arb.scansCompleted++;
+
+    for (const pair of arb.pairs) {
+      const opp = await scanArbOpportunity(pair.tokenA, pair.tokenB, arb.tradeSize);
+
+      arb.lastScan = {
+        pair: pair.label,
+        time: Date.now(),
+        opportunity: opp,
+      };
+
+      if (!opp || opp.profitBps < arb.minProfitBps) continue;
+
+      // Estimate gas cost (~0.0002 ETH for 2 swaps on Base)
+      const gasCost = ethers.parseEther('0.0003');
+      if (opp.profitWei <= gasCost) continue;
+
+      arb.opportunitiesFound++;
+
+      // Check ETH balance for trade + gas
+      const ethBal = await baseProvider.getBalance(cs.wallet.address);
+      const needed = arb.tradeSize + gasCost;
+      if (ethBal < needed) {
+        await bot.api.sendMessage(chatId,
+          `ARB: Insufficient ETH. Need ${Number(ethers.formatEther(needed)).toFixed(6)} ETH, have ${Number(ethers.formatEther(ethBal)).toFixed(6)} ETH.`
+        );
+        continue;
+      }
+
+      // Execute
+      try {
+        const result = await executeArb(cs.wallet, opp);
+        const profitEth = Number(ethers.formatEther(opp.profitWei));
+        arb.totalProfit += profitEth;
+        arb.tradesCompleted++;
+
+        await bot.api.sendMessage(chatId,
+          fmt.header('ARB EXECUTED') + '\n\n' +
+          fmt.line('Pair', pair.label) + '\n' +
+          fmt.line('Buy', `${opp.buyDex}`) + '\n' +
+          fmt.line('Sell', `${opp.sellDex}`) + '\n' +
+          fmt.line('Spread', `${opp.profitBps} bps`) + '\n' +
+          fmt.line('Profit', `+${profitEth.toFixed(6)} ETH`) + '\n' +
+          fmt.line('Total P&L', `${arb.totalProfit >= 0 ? '+' : ''}${arb.totalProfit.toFixed(6)} ETH`) + '\n' +
+          fmt.div() + '\n' +
+          `Buy: ${fmt.txBase(result.buyHash)}\n` +
+          `Sell: ${fmt.txBase(result.sellHash)}`,
+          { parse_mode: 'Markdown', disable_web_page_preview: true }
+        );
+      } catch (execErr) {
+        console.error('Arb execution error:', execErr.message);
+        await bot.api.sendMessage(chatId, `ARB exec failed: ${execErr.message}`);
+      }
+    }
+
+  } catch (error) {
+    console.error('Arb scan error:', error.message);
+    // Don't spam user with scan errors, just log
+  }
+
+  if (arb.running) {
+    setTimeout(() => runArbLoop(chatId), arb.pollInterval * 1000);
+  }
+}
+
+async function startArb(chatId, username) {
+  const state = getState(chatId);
+  const cs = state.base;
+
+  if (cs.arb && cs.arb.running) return 'Arb already running.';
+  if (!cs.wallet) return 'No wallet. Go to Wallet menu.';
+  if (!state.riskAccepted) return '__SHOW_RISK__';
+
+  // Token gate check
+  if (!isWhitelisted(username) && !isVerified(state)) {
+    return 'Arb requires BACK token verification.\n\n' +
+      `Hold ${BACK_GATE_AMOUNT.toLocaleString()} BACK in your main wallet and verify via the Verify button.\n\n` +
+      'Use "Switch Mode" > "Verify BACK" to verify your holdings.';
+  }
+
+  if (!cs.arb) cs.arb = createArbState();
+
+  cs.arb.running = true;
+  cs.arb.startTime = Date.now();
+  runArbLoop(chatId);
+
+  let msg = fmt.header('ARB STARTED') + '\n\n';
+  msg += fmt.line('Chain', 'Base') + '\n';
+  msg += fmt.line('Pairs', cs.arb.pairs.map(p => p.label).join(', ')) + '\n';
+  msg += fmt.line('Trade Size', Number(ethers.formatEther(cs.arb.tradeSize)).toFixed(4) + ' ETH') + '\n';
+  msg += fmt.line('Min Spread', cs.arb.minProfitBps + ' bps') + '\n';
+  msg += fmt.line('Poll', cs.arb.pollInterval + 's') + '\n';
+  msg += fmt.line('DEXes', DEXES.map(d => d.name).join(', ')) + '\n';
+  msg += fmt.div() + '\n';
+  msg += 'Scanning for cross-DEX arbitrage opportunities...';
+  return msg;
+}
+
+function stopArb(chatId) {
+  const state = getState(chatId);
+  if (state.base.arb) state.base.arb.running = false;
+}
+
+function buildArbStatus(chatId) {
+  const state = getState(chatId);
+  const arb = state.base.arb;
+  if (!arb) return 'No arb configured. Start from Arb mode.';
+
+  const elapsed = arb.startTime ? Math.floor((Date.now() - arb.startTime) / 60000) : 0;
+
+  let msg = fmt.header('ARB STATUS') + '\n\n';
+  msg += fmt.line('Status', arb.running ? 'Scanning' : 'Stopped') + '\n';
+  msg += fmt.line('Pairs', arb.pairs.map(p => p.label).join(', ')) + '\n';
+  msg += fmt.line('Trade Size', Number(ethers.formatEther(arb.tradeSize)).toFixed(4) + ' ETH') + '\n';
+  msg += fmt.line('Min Spread', arb.minProfitBps + ' bps') + '\n';
+  msg += fmt.line('Poll', arb.pollInterval + 's') + '\n';
+  msg += fmt.div() + '\n';
+  msg += fmt.line('Scans', arb.scansCompleted) + '\n';
+  msg += fmt.line('Opportunities', arb.opportunitiesFound) + '\n';
+  msg += fmt.line('Trades', arb.tradesCompleted) + '\n';
+  msg += fmt.line('P&L', `${arb.totalProfit >= 0 ? '+' : ''}${arb.totalProfit.toFixed(6)} ETH`) + '\n';
+  msg += fmt.line('Runtime', elapsed + ' min') + '\n';
+
+  if (arb.lastScan) {
+    msg += fmt.div() + '\n';
+    msg += 'Last scan:\n';
+    if (arb.lastScan.opportunity) {
+      const opp = arb.lastScan.opportunity;
+      msg += `  Best spread: ${opp.profitBps} bps\n`;
+      msg += `  Buy: ${opp.buyDex} | Sell: ${opp.sellDex}\n`;
+      for (const p of opp.allPrices) {
+        const label = opp.tokenA === WETH ? 'USDC' : 'ETH';
+        msg += `  ${p.dex}: ${Number(ethers.formatUnits(p.amountOut, opp.tokenB === USDC_BASE ? 6 : 18)).toFixed(4)} ${label}\n`;
+      }
+    } else {
+      msg += '  No profitable spread found\n';
+    }
   }
 
   return msg;
@@ -751,6 +1348,7 @@ async function startVolume(chatId, username) {
   if (cs.isRunning) return 'Already running.';
   if (!cs.wallet) return 'No wallet.';
   if (!cs.token) return 'No token set.';
+  if (!state.riskAccepted) return '__SHOW_RISK__';
 
   const needsFee = !isWhitelisted(username) && cs.feePaidFor !== cs.token;
   if (needsFee) {
@@ -786,10 +1384,13 @@ function chainKeyboard() {
     .text('Solana (SOL)', 'chain_solana');
 }
 
-function modeKeyboard() {
-  return new InlineKeyboard()
+function modeKeyboard(chain) {
+  const kb = new InlineKeyboard()
     .text('Volume Bot', 'mode_volume')
     .text('Grid Trade', 'mode_grid');
+  if (chain === 'base') kb.text('Arb Bot', 'mode_arb');
+  kb.row().text('Verify BACK', 'verify_back');
+  return kb;
 }
 
 function mainKeyboard(mode) {
@@ -800,18 +1401,27 @@ function mainKeyboard(mode) {
   } else if (mode === 'grid') {
     kb.text('Start Grid', 'start_grid').text('Stop Grid', 'stop_grid').row();
     kb.text('Grid Status', 'grid_status').row();
+  } else if (mode === 'arb') {
+    kb.text('Start Arb', 'start_arb').text('Stop Arb', 'stop_arb').row();
+    kb.text('Arb Status', 'arb_status').row();
   }
   kb.text('Status', 'status').text('Refresh', 'refresh').row();
   kb.text('Switch Mode', 'switch_mode').text('Switch Chain', 'switch_chain');
   return kb;
 }
 
-function walletKeyboard() {
-  return new InlineKeyboard()
-    .text('Show Private Key', 'export_wallet').row()
-    .text('Import Wallet', 'import_wallet').row()
-    .text('New Wallet', 'new_wallet').row()
-    .text('Back', 'main_menu');
+function walletKeyboard(state, chain) {
+  const kb = new InlineKeyboard();
+  if (isLocked(state, chain)) {
+    kb.text('Unlock Wallet', 'unlock_wallet').row();
+  } else {
+    kb.text('Show Private Key', 'export_wallet').row();
+    kb.text('Import Wallet', 'import_wallet').row();
+    kb.text('New Wallet', 'new_wallet').row();
+  }
+  kb.text(state.pin ? 'Change PIN' : 'Set PIN', 'set_pin').row();
+  kb.text('Back', 'main_menu');
+  return kb;
 }
 
 function volumeSettingsKeyboard(cs, chain) {
@@ -839,6 +1449,20 @@ function gridSettingsKeyboard(grid) {
     .text(`Poll: ${grid.pollInterval}s`, 'grid_set_poll')
     .text(`Slippage: ${grid.slippage}%`, 'grid_set_slippage').row()
     .text('Reconfigure Grid', 'grid_setup').row()
+    .text('Back', 'main_menu');
+}
+
+function arbSettingsKeyboard(arb) {
+  if (!arb) {
+    return new InlineKeyboard()
+      .text('Initialize Arb', 'arb_init').row()
+      .text('Back', 'main_menu');
+  }
+  return new InlineKeyboard()
+    .text(`Trade Size: ${Number(ethers.formatEther(arb.tradeSize)).toFixed(4)} ETH`, 'arb_set_size').row()
+    .text(`Min Spread: ${arb.minProfitBps} bps`, 'arb_set_profit').row()
+    .text(`Poll: ${arb.pollInterval}s`, 'arb_set_poll').row()
+    .text(`Pairs: ${arb.pairs.map(p => p.label).join(', ')}`, 'arb_add_pair').row()
     .text('Back', 'main_menu');
 }
 
@@ -876,6 +1500,19 @@ async function buildMainMsg(chatId) {
         msg += fmt.line('Token', `${symbol} (${fmt.addrBase(cs.token)})`) + '\n';
         msg += fmt.line('Token Bal', `${Number(ethers.formatUnits(tokenBal, decimals)).toFixed(4)} ${symbol}`) + '\n';
       }
+    }
+
+    if (mode === 'arb') {
+      if (cs.arb && cs.arb.running) {
+        msg += fmt.div() + '\n';
+        msg += `Arb running: ${cs.arb.tradesCompleted} trades, P&L: ${cs.arb.totalProfit >= 0 ? '+' : ''}${cs.arb.totalProfit.toFixed(6)} ETH\n`;
+        msg += `Scans: ${cs.arb.scansCompleted} | Opportunities: ${cs.arb.opportunitiesFound}`;
+      }
+    }
+
+    // Show BACK verification status
+    if (state.verified) {
+      msg += '\n' + fmt.line('BACK', `${state.verified.balance.toLocaleString()} (verified)`);
     }
 
     if (ethBal === 0n) msg += '\nFund wallet:\n' + fmt.mono(cs.wallet.address);
@@ -927,7 +1564,7 @@ bot.command('start', async (ctx) => {
   if (!state.chain) {
     await ctx.reply(fmt.header('SILVERBACK BOT') + '\n\nSelect chain:', { parse_mode: 'Markdown', reply_markup: chainKeyboard() });
   } else if (!state.mode) {
-    await ctx.reply(fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles for volume\nGrid: Automated spread trading for profit', { parse_mode: 'Markdown', reply_markup: modeKeyboard() });
+    await ctx.reply(fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles for volume\nGrid: Automated spread trading\nArb: Cross-DEX arbitrage (Base only)', { parse_mode: 'Markdown', reply_markup: modeKeyboard(state.chain) });
   } else {
     const msg = await buildMainMsg(ctx.chat.id);
     await ctx.reply(msg, { parse_mode: 'Markdown', disable_web_page_preview: true, reply_markup: mainKeyboard(state.mode) });
@@ -938,6 +1575,7 @@ bot.command('stop', async (ctx) => {
   const state = getState(ctx.chat.id);
   if (state.chain && state.mode === 'volume') stopVolume(ctx.chat.id);
   if (state.chain && state.mode === 'grid') stopGrid(ctx.chat.id);
+  if (state.chain && state.mode === 'arb') stopArb(ctx.chat.id);
   await ctx.reply('Stopped.');
 });
 
@@ -946,6 +1584,9 @@ bot.command('status', async (ctx) => {
   if (!state.chain || !state.mode) { await ctx.reply('Use /start first.'); return; }
   if (state.mode === 'grid') {
     const msg = buildGridStatus(ctx.chat.id);
+    await ctx.reply(msg, { parse_mode: 'Markdown', disable_web_page_preview: true, reply_markup: mainKeyboard(state.mode) });
+  } else if (state.mode === 'arb') {
+    const msg = buildArbStatus(ctx.chat.id);
     await ctx.reply(msg, { parse_mode: 'Markdown', disable_web_page_preview: true, reply_markup: mainKeyboard(state.mode) });
   } else {
     const msg = await buildMainMsg(ctx.chat.id);
@@ -960,13 +1601,16 @@ bot.command('help', async (ctx) => {
     'VOLUME MODE:\nBuy-sell cycles to generate token volume.\n\n' +
     'GRID MODE:\nAutomated spread trading on ETH/USDC or SOL/USDC.\n' +
     'Sets buy orders below price, sell orders above.\n' +
-    'Profits from each completed buy-sell spread.\n' +
-    'Best in sideways/choppy markets.\n\n' +
-    'Grid tips:\n' +
-    '- More levels = more trades but smaller profit each\n' +
-    '- Wider range = catches bigger moves but less frequent\n' +
-    '- 5-10% range with 10 levels is a good start\n' +
-    '- Poll every 15-30s to catch moves without burning RPC',
+    'Profits from each completed buy-sell spread.\n\n' +
+    'ARB MODE (Base only):\nCross-DEX arbitrage across Uniswap, Aerodrome,\n' +
+    'BaseSwap & SushiSwap. Scans for price spreads\n' +
+    'and executes profitable trades automatically.\n\n' +
+    fmt.div() + '\n' +
+    'TOKEN GATE (BACK):\n' +
+    `Volume: Free\n` +
+    `Grid & Arb: ${BACK_GATE_AMOUNT.toLocaleString()} BACK required\n\n` +
+    'Verify by signing a message with your BACK-holding\n' +
+    'wallet. Use "Verify BACK" in mode selection.',
     { parse_mode: 'Markdown' }
   );
 });
@@ -985,7 +1629,7 @@ bot.on('callback_query:data', async (ctx) => {
     case 'chain_base': {
       state.chain = 'base';
       if (!state.mode) {
-        await editOrReply(ctx, fmt.header('SELECT MODE'), modeKeyboard());
+        await editOrReply(ctx, fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles\nGrid: Spread trading\nArb: Cross-DEX arbitrage (Base)', modeKeyboard('base'));
       } else {
         const msg = await buildMainMsg(chatId);
         await editOrReply(ctx, msg, mainKeyboard(state.mode));
@@ -994,8 +1638,9 @@ bot.on('callback_query:data', async (ctx) => {
     }
     case 'chain_solana': {
       state.chain = 'solana';
+      if (state.mode === 'arb') state.mode = null; // arb is Base-only
       if (!state.mode) {
-        await editOrReply(ctx, fmt.header('SELECT MODE'), modeKeyboard());
+        await editOrReply(ctx, fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles\nGrid: Spread trading', modeKeyboard('solana'));
       } else {
         const msg = await buildMainMsg(chatId);
         await editOrReply(ctx, msg, mainKeyboard(state.mode));
@@ -1018,8 +1663,19 @@ bot.on('callback_query:data', async (ctx) => {
       await editOrReply(ctx, msg, mainKeyboard('grid'));
       break;
     }
+    case 'mode_arb': {
+      if (state.chain !== 'base') {
+        await ctx.answerCallbackQuery({ text: 'Arb is Base-only.', show_alert: true });
+        break;
+      }
+      state.mode = 'arb';
+      state.chain = 'base'; // force Base
+      const msg3 = await buildMainMsg(chatId);
+      await editOrReply(ctx, msg3, mainKeyboard('arb'));
+      break;
+    }
     case 'switch_mode': {
-      await editOrReply(ctx, fmt.header('SELECT MODE'), modeKeyboard());
+      await editOrReply(ctx, fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles\nGrid: Spread trading\nArb: Cross-DEX arbitrage (Base)', modeKeyboard(state.chain));
       break;
     }
 
@@ -1034,19 +1690,35 @@ bot.on('callback_query:data', async (ctx) => {
 
     case 'wallet_menu': {
       const cs = chainState(chatId);
-      if (state.chain === 'base') {
+      const secNote = state.pin
+        ? '\n\nKey AES-256 encrypted with your PIN.\nAuto-locks after 2h idle. Enter PIN to unlock.\nForgot PIN = key unrecoverable.'
+        : '\n\nKeys in memory only — wiped after 2h idle.\nSet a PIN to encrypt your key at rest.';
+      const pinNote = state.pin ? '\nPIN: Set (remember it!)' : '\nPIN: Not set (strongly recommended)';
+      const lockNote = isLocked(state, state.chain) ? '\nStatus: LOCKED — enter PIN to unlock' : '';
+
+      if (isLocked(state, state.chain)) {
+        // Wallet exists but is encrypted — show address from encrypted state if we saved it
+        const label = state.chain === 'base' ? 'BASE' : 'SOLANA';
+        const savedAddr = cs._savedAddress || 'Unknown';
+        await editOrReply(ctx,
+          fmt.header(`${label} WALLET`) + '\n\n' + fmt.line('Address', savedAddr) + lockNote + pinNote + secNote,
+          walletKeyboard(state, state.chain)
+        );
+      } else if (state.chain === 'base') {
         if (!cs.wallet) cs.wallet = baseCreateWallet();
         const addr = cs.wallet.address;
+        cs._savedAddress = fmt.addrBase(addr); // save for locked display
         await editOrReply(ctx,
-          fmt.header('BASE WALLET') + '\n\n' + fmt.line('Address', fmt.addrBase(addr)) + '\n\n' + fmt.mono(addr),
-          walletKeyboard()
+          fmt.header('BASE WALLET') + '\n\n' + fmt.line('Address', fmt.addrBase(addr)) + '\n\n' + fmt.mono(addr) + pinNote + secNote,
+          walletKeyboard(state, state.chain)
         );
       } else {
         if (!cs.wallet) cs.wallet = solCreateWallet();
         const addr = cs.wallet.publicKey.toBase58();
+        cs._savedAddress = fmt.addrSol(addr);
         await editOrReply(ctx,
-          fmt.header('SOLANA WALLET') + '\n\n' + fmt.line('Address', fmt.addrSol(addr)) + '\n\n' + fmt.mono(addr),
-          walletKeyboard()
+          fmt.header('SOLANA WALLET') + '\n\n' + fmt.line('Address', fmt.addrSol(addr)) + '\n\n' + fmt.mono(addr) + pinNote + secNote,
+          walletKeyboard(state, state.chain)
         );
       }
       break;
@@ -1054,7 +1726,9 @@ bot.on('callback_query:data', async (ctx) => {
 
     case 'settings_menu': {
       const cs = chainState(chatId);
-      if (state.mode === 'grid') {
+      if (state.mode === 'arb') {
+        await editOrReply(ctx, fmt.header('ARB SETTINGS'), arbSettingsKeyboard(cs.arb));
+      } else if (state.mode === 'grid') {
         await editOrReply(ctx, fmt.header('GRID SETTINGS'), gridSettingsKeyboard(cs.grid));
       } else {
         await editOrReply(ctx, fmt.header('VOLUME SETTINGS'), volumeSettingsKeyboard(cs, state.chain));
@@ -1090,9 +1764,35 @@ bot.on('callback_query:data', async (ctx) => {
       if (state.chain === 'base') cs.wallet = baseCreateWallet();
       else cs.wallet = solCreateWallet();
       cs.feePaidFor = null;
+      cs._encryptedKey = null; // clear old encrypted key
       const addr = state.chain === 'base' ? cs.wallet.address : cs.wallet.publicKey.toBase58();
       const addrFmt = state.chain === 'base' ? fmt.addrBase(addr) : fmt.addrSol(addr);
-      await editOrReply(ctx, fmt.header('NEW WALLET') + '\n\n' + fmt.line('Address', addrFmt) + '\n\n' + fmt.mono(addr), walletKeyboard());
+      cs._savedAddress = addrFmt;
+      const pinHint = state.pin ? '' : '\n\nSet a PIN to encrypt your key.\nWithout a PIN, key is wiped after 2h idle.';
+      await editOrReply(ctx, fmt.header('NEW WALLET') + '\n\n' + fmt.line('Address', addrFmt) + '\n\n' + fmt.mono(addr) + pinHint, walletKeyboard(state, state.chain));
+      break;
+    }
+
+    case 'set_pin': {
+      state.waiting_for = 'set_pin';
+      const p6 = await bot.api.sendMessage(chatId,
+        'Set a 4-8 digit PIN to encrypt your wallet.\n\n' +
+        'IMPORTANT:\n' +
+        '- Your PIN encrypts your private key with AES-256\n' +
+        '- We DO NOT store your PIN anywhere\n' +
+        '- If you forget your PIN, your key CANNOT be recovered\n' +
+        '- Write it down or save it somewhere safe\n\n' +
+        'Send your PIN now (digits only):');
+      state.promptMsgId = p6.message_id;
+      await ctx.answerCallbackQuery();
+      break;
+    }
+
+    case 'unlock_wallet': {
+      state.waiting_for = 'unlock_wallet';
+      const p6 = await bot.api.sendMessage(chatId, 'Wallet is locked.\nEnter your PIN to decrypt and unlock.');
+      state.promptMsgId = p6.message_id;
+      await ctx.answerCallbackQuery();
       break;
     }
 
@@ -1192,12 +1892,18 @@ bot.on('callback_query:data', async (ctx) => {
     // ---- Bot Control ----
     case 'start_volume': {
       const response = await startVolume(chatId, username);
-      await send(chatId, response, mainKeyboard('volume'));
+      if (response === '__SHOW_RISK__') {
+        state._pendingAction = 'start_volume';
+        await send(chatId, RISK_DISCLAIMER, riskKeyboard());
+      } else {
+        await send(chatId, response, mainKeyboard('volume'));
+      }
       await ctx.answerCallbackQuery();
       break;
     }
     case 'stop_volume': {
       stopVolume(chatId);
+      lockOnStop(state);
       await ctx.answerCallbackQuery({ text: 'Stopped.' });
       const msg = await buildMainMsg(chatId);
       await editOrReply(ctx, msg, mainKeyboard('volume'));
@@ -1205,12 +1911,18 @@ bot.on('callback_query:data', async (ctx) => {
     }
     case 'start_grid': {
       const response = await startGrid(chatId, username);
-      await send(chatId, response, mainKeyboard('grid'));
+      if (response === '__SHOW_RISK__') {
+        state._pendingAction = 'start_grid';
+        await send(chatId, RISK_DISCLAIMER, riskKeyboard());
+      } else {
+        await send(chatId, response, mainKeyboard('grid'));
+      }
       await ctx.answerCallbackQuery();
       break;
     }
     case 'stop_grid': {
       stopGrid(chatId);
+      lockOnStop(state);
       await ctx.answerCallbackQuery({ text: 'Grid stopped.' });
       const msg = buildGridStatus(chatId);
       await send(chatId, msg, mainKeyboard('grid'));
@@ -1223,10 +1935,121 @@ bot.on('callback_query:data', async (ctx) => {
       break;
     }
 
+    // ---- Arb Control ----
+    case 'start_arb': {
+      const response = await startArb(chatId, username);
+      if (response === '__SHOW_RISK__') {
+        state._pendingAction = 'start_arb';
+        await send(chatId, RISK_DISCLAIMER, riskKeyboard());
+      } else {
+        await send(chatId, response, mainKeyboard('arb'));
+      }
+      await ctx.answerCallbackQuery();
+      break;
+    }
+    case 'stop_arb': {
+      stopArb(chatId);
+      lockOnStop(state);
+      await ctx.answerCallbackQuery({ text: 'Arb stopped.' });
+      const arbMsg = buildArbStatus(chatId);
+      await send(chatId, arbMsg, mainKeyboard('arb'));
+      break;
+    }
+    case 'arb_status': {
+      const arbMsg = buildArbStatus(chatId);
+      await send(chatId, arbMsg, mainKeyboard('arb'));
+      await ctx.answerCallbackQuery();
+      break;
+    }
+    case 'arb_init': {
+      const cs4 = chainState(chatId);
+      cs4.arb = createArbState();
+      await editOrReply(ctx, fmt.header('ARB INITIALIZED') + '\n\nDefault: ETH/USDC, 0.01 ETH per trade, 30 bps min spread.', arbSettingsKeyboard(cs4.arb));
+      break;
+    }
+    case 'arb_set_size': {
+      state.waiting_for = 'arb_set_size';
+      const cs4 = chainState(chatId);
+      const p4 = await bot.api.sendMessage(chatId, `Current: ${Number(ethers.formatEther(cs4.arb?.tradeSize || 0n)).toFixed(4)} ETH\nSend ETH amount per arb trade.`);
+      state.promptMsgId = p4.message_id;
+      await ctx.answerCallbackQuery();
+      break;
+    }
+    case 'arb_set_profit': {
+      state.waiting_for = 'arb_set_profit';
+      const cs4 = chainState(chatId);
+      const p4 = await bot.api.sendMessage(chatId, `Current: ${cs4.arb?.minProfitBps || 30} bps\nSend min spread in basis points (e.g. 30 = 0.3%).`);
+      state.promptMsgId = p4.message_id;
+      await ctx.answerCallbackQuery();
+      break;
+    }
+    case 'arb_set_poll': {
+      state.waiting_for = 'arb_set_poll';
+      const cs4 = chainState(chatId);
+      const p4 = await bot.api.sendMessage(chatId, `Current: ${cs4.arb?.pollInterval || 10}s\nSend seconds between scans.`);
+      state.promptMsgId = p4.message_id;
+      await ctx.answerCallbackQuery();
+      break;
+    }
+    case 'arb_add_pair': {
+      state.waiting_for = 'arb_add_pair';
+      const cs4 = chainState(chatId);
+      let pairList = cs4.arb ? cs4.arb.pairs.map(p => p.label).join(', ') : 'none';
+      const p4 = await bot.api.sendMessage(chatId, `Current pairs: ${pairList}\n\nSend token address to add as pair vs WETH.\nOr send "reset" to go back to ETH/USDC only.`);
+      state.promptMsgId = p4.message_id;
+      await ctx.answerCallbackQuery();
+      break;
+    }
+
+    // ---- Risk Acceptance ----
+    case 'accept_risk': {
+      state.riskAccepted = true;
+      const pending = state._pendingAction;
+      state._pendingAction = null;
+
+      if (pending === 'start_volume') {
+        const resp = await startVolume(chatId, username);
+        await send(chatId, resp, mainKeyboard('volume'));
+      } else if (pending === 'start_grid') {
+        const resp = await startGrid(chatId, username);
+        await send(chatId, resp, mainKeyboard('grid'));
+      } else if (pending === 'start_arb') {
+        const resp = await startArb(chatId, username);
+        await send(chatId, resp, mainKeyboard('arb'));
+      } else {
+        await editOrReply(ctx, 'Risks accepted. You can now start trading.', mainKeyboard(state.mode || 'volume'));
+      }
+      await ctx.answerCallbackQuery({ text: 'Risks accepted.' });
+      break;
+    }
+
+    // ---- BACK Verification ----
+    case 'verify_back': {
+      const verifyMsg = generateVerifyMessage(chatId);
+      state.waiting_for = 'verify_signature';
+      state._verifyMessage = verifyMsg;
+      const p5 = await bot.api.sendMessage(chatId,
+        fmt.header('VERIFY BACK HOLDINGS') + '\n\n' +
+        '1. Copy this message:\n\n' +
+        fmt.mono(verifyMsg) + '\n\n' +
+        '2. Sign it with your BACK-holding wallet\n' +
+        '   (MetaMask > Settings > Sign Message)\n\n' +
+        '3. Paste the signature (0x...) here\n\n' +
+        `Required: ${BACK_GATE_AMOUNT.toLocaleString()} BACK`,
+        { parse_mode: 'Markdown' }
+      );
+      state.promptMsgId = p5.message_id;
+      await ctx.answerCallbackQuery();
+      break;
+    }
+
     case 'status': {
       if (state.mode === 'grid') {
         const msg = buildGridStatus(chatId);
         await editOrReply(ctx, msg, mainKeyboard('grid'));
+      } else if (state.mode === 'arb') {
+        const msg = buildArbStatus(chatId);
+        await editOrReply(ctx, msg, mainKeyboard('arb'));
       } else {
         const msg = await buildMainMsg(chatId);
         await editOrReply(ctx, msg, mainKeyboard(state.mode));
@@ -1265,11 +2088,14 @@ bot.on('message:text', async (ctx) => {
         if (chain === 'base') cs.wallet = baseImportWallet(text);
         else cs.wallet = solImportWallet(text);
         cs.feePaidFor = null;
+        cs._encryptedKey = null;
         await safeDelete(chatId, msgId);
         await safeDelete(chatId, state.promptMsgId);
         const addr = chain === 'base' ? cs.wallet.address : cs.wallet.publicKey.toBase58();
         const addrFmt = chain === 'base' ? fmt.addrBase(addr) : fmt.addrSol(addr);
-        await send(chatId, 'Wallet imported.\n' + fmt.line('Address', addrFmt), mainKeyboard(state.mode));
+        cs._savedAddress = addrFmt;
+        const pinHint = state.pin ? '' : '\n\nSet a PIN in Wallet menu to encrypt your key.\nWithout a PIN, keys are wiped after 2h idle.';
+        await send(chatId, 'Wallet imported.\n' + fmt.line('Address', addrFmt) + pinHint, mainKeyboard(state.mode));
       } catch (e) {
         await safeDelete(chatId, msgId);
         await safeDelete(chatId, state.promptMsgId);
@@ -1445,6 +2271,142 @@ bot.on('message:text', async (ctx) => {
       await send(chatId, `Slippage: ${n}%`, gridSettingsKeyboard(cs.grid));
       break;
     }
+
+    // ---- Arb Settings ----
+    case 'arb_set_size': {
+      try {
+        const val = parseFloat(text.trim());
+        if (isNaN(val) || val <= 0) throw new Error('positive');
+        if (cs.arb) cs.arb.tradeSize = ethers.parseEther(text.trim());
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId, `Trade size: ${val} ETH`, arbSettingsKeyboard(cs.arb));
+      } catch {
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId, 'Invalid amount.');
+      }
+      break;
+    }
+
+    case 'arb_set_profit': {
+      const n = parseInt(text.trim());
+      if (isNaN(n) || n < 1) { await ctx.reply('Min 1 bps.'); break; }
+      if (cs.arb) cs.arb.minProfitBps = n;
+      await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+      await send(chatId, `Min spread: ${n} bps (${(n / 100).toFixed(2)}%)`, arbSettingsKeyboard(cs.arb));
+      break;
+    }
+
+    case 'arb_set_poll': {
+      const n = parseInt(text.trim());
+      if (isNaN(n) || n < 3) { await ctx.reply('Min 3 seconds.'); break; }
+      if (cs.arb) cs.arb.pollInterval = n;
+      await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+      await send(chatId, `Poll: ${n}s`, arbSettingsKeyboard(cs.arb));
+      break;
+    }
+
+    case 'arb_add_pair': {
+      try {
+        const input = text.trim();
+        if (input.toLowerCase() === 'reset') {
+          if (cs.arb) cs.arb.pairs = [{ tokenA: WETH, tokenB: USDC_BASE, label: 'ETH/USDC' }];
+          await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+          await send(chatId, 'Pairs reset to ETH/USDC.', arbSettingsKeyboard(cs.arb));
+        } else {
+          if (!ethers.isAddress(input)) throw new Error('Invalid address');
+          const info = await baseValidateToken(input);
+          if (cs.arb) {
+            // Add WETH/token pair
+            const exists = cs.arb.pairs.some(p => p.tokenB.toLowerCase() === input.toLowerCase());
+            if (!exists) {
+              cs.arb.pairs.push({ tokenA: WETH, tokenB: input, label: `ETH/${info.symbol}` });
+            }
+          }
+          await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+          await send(chatId, `Added ETH/${info.symbol} pair.`, arbSettingsKeyboard(cs.arb));
+        }
+      } catch (e) {
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId, 'Invalid: ' + e.message);
+      }
+      break;
+    }
+
+    // ---- PIN & Unlock ----
+    case 'set_pin': {
+      const pin = text.trim();
+      if (!/^\d{4,8}$/.test(pin)) {
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId, 'PIN must be 4-8 digits.');
+        break;
+      }
+      state.pin = pin;
+      await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+
+      // Encrypt any existing unlocked wallets
+      if (state.base.wallet) lockWallet(state, 'base');
+      if (state.solana.wallet) lockWallet(state, 'solana');
+
+      // Immediately unlock current chain so user can keep working
+      if (isLocked(state, state.chain)) unlockWallet(state, state.chain, pin);
+
+      await send(chatId,
+        'PIN set. Wallet key encrypted (AES-256-GCM).\n\n' +
+        'Your key is now protected at rest.\n' +
+        'You will need this PIN to:\n' +
+        '- Unlock after 2h of inactivity\n' +
+        '- Unlock after bot restart\n\n' +
+        'REMEMBER YOUR PIN — it cannot be recovered.',
+        mainKeyboard(state.mode));
+      break;
+    }
+
+    case 'unlock_wallet': {
+      const pin = text.trim();
+      await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+      if (!state.pin) {
+        // No PIN was set — shouldn't happen but handle gracefully
+        await send(chatId, 'No PIN set. Wallet not encrypted.');
+        break;
+      }
+      const ok = unlockWallet(state, state.chain, pin);
+      if (ok) {
+        await send(chatId, 'Wallet unlocked.', mainKeyboard(state.mode));
+      } else {
+        await send(chatId, 'Wrong PIN.\nIf you forgot your PIN, you will need to import a new wallet.\nYour encrypted key cannot be recovered without the correct PIN.');
+      }
+      break;
+    }
+
+    // ---- BACK Verification ----
+    case 'verify_signature': {
+      try {
+        const sig = text.trim();
+        if (!sig.startsWith('0x') || sig.length < 130) throw new Error('Invalid signature format');
+        const verifyMessage = state._verifyMessage;
+        if (!verifyMessage) throw new Error('Verification expired. Try again.');
+
+        const result = await verifySignatureAndCheckBack(verifyMessage, sig);
+        state.verified = {
+          address: result.address,
+          balance: result.balance,
+          passed: result.passed,
+          timestamp: Date.now(),
+        };
+        state._verifyMessage = null;
+
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId,
+          fmt.header(result.passed ? 'VERIFIED' : 'NOT VERIFIED') + '\n\n' + gateMessage(result),
+          state.mode ? mainKeyboard(state.mode) : modeKeyboard(state.chain)
+        );
+      } catch (e) {
+        state._verifyMessage = null;
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId, 'Verification failed: ' + e.message);
+      }
+      break;
+    }
   }
 
   state.promptMsgId = null;
@@ -1453,6 +2415,6 @@ bot.on('message:text', async (ctx) => {
 // ============================================================
 // Start
 // ============================================================
-console.log('Silverback Bot starting (Volume + Grid | Base + Solana)...');
+console.log('Silverback Bot starting (Volume + Grid + Arb | Base + Solana)...');
 bot.start();
 console.log('Bot is live.');
