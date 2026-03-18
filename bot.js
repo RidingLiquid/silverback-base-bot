@@ -31,6 +31,7 @@ const SUSHISWAP_ROUTER = '0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891';
 
 // BACK Token Gate
 const BACK_TOKEN = '0x558881c4959e9cf961a7E1815FCD6586906babd2';
+const VIRTUAL_TOKEN = '0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b';
 let BACK_GATE_AMOUNT = 60000; // adjustable threshold
 const GATE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24h re-verify
 const WALLET_WIPE_MS = 2 * 60 * 60 * 1000; // 2h inactivity wipe
@@ -128,7 +129,7 @@ function getState(userId) {
   if (!userStates.has(userId)) {
     userStates.set(userId, {
       chain: null,
-      mode: null, // 'volume', 'grid', or 'arb'
+      mode: null, // 'volume', 'grid', 'arb', or 'accumulate'
       // Token gate verification
       verified: null, // { address, balance, timestamp }
       base: {
@@ -142,6 +143,8 @@ function getState(userId) {
         grid: null, // active grid state
         // Arb settings
         arb: null, // active arb state
+        // Accumulate settings
+        accum: null, // active accumulate state
       },
       solana: {
         wallet: null,
@@ -462,6 +465,277 @@ async function baseSellETHForUSDC(wallet, amountETH, slippage) {
   const tx = await r.swapExactETHForTokens(minOut, path, wallet.address, deadline, { value: amountETH, gasLimit: 300000n });
   const receipt = await tx.wait();
   return { hash: receipt.hash, amountOut: amounts[1] };
+}
+
+// ============================================================
+// ACCUMULATE: Price-reactive VIRTUAL <-> BACK trading
+// ============================================================
+// Strategy: Track VIRTUAL/BACK price ratio over time.
+//   - VIRTUAL pumps (price above avg by threshold%) → buy BACK with VIRTUAL
+//   - VIRTUAL dips (price below avg by threshold%) → sell some BACK for cheap VIRTUAL
+//   - Flat → skip, save gas
+// Net effect: accumulate BACK by buying when VIRTUAL is strong, reloading when cheap.
+
+const PAIR_ABI = [
+  'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+  'function token0() view returns (address)',
+];
+const VIRTUAL_BACK_PAIR = '0xE84923f730526819FAa23F4203CFFDd92F0636C3';
+
+async function baseSwapTokenToToken(wallet, tokenIn, tokenOut, amountIn, slippage) {
+  const signer = wallet.connect(baseProvider);
+  const tokenContract = new ethers.Contract(tokenIn, ERC20_ABI, signer);
+  const allowance = await tokenContract.allowance(wallet.address, UNISWAP_V2_ROUTER);
+  if (allowance < amountIn) {
+    const appTx = await tokenContract.approve(UNISWAP_V2_ROUTER, ethers.MaxUint256);
+    await appTx.wait();
+  }
+  const r = baseRouter.connect(signer);
+  const path = [tokenIn, tokenOut];
+  const amounts = await baseRouter.getAmountsOut(amountIn, path);
+  const minOut = amounts[1] * BigInt(100 - slippage) / 100n;
+  const deadline = Math.floor(Date.now() / 1000) + 1200;
+  const tx = await r.swapExactTokensForTokens(amountIn, minOut, path, wallet.address, deadline, { gasLimit: 350000n });
+  const receipt = await tx.wait();
+  return { hash: receipt.hash, amountOut: amounts[1] };
+}
+
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+function defaultAccumState() {
+  return {
+    running: false, cycle: 0, trades: 0, skips: 0,
+    minAmount: ethers.parseUnits('1', 18), maxAmount: ethers.parseUnits('5', 18),
+    minDelay: 120, maxDelay: 300, threshold: 2,
+    recyclePercent: 15, slippage: 20,
+    priceHistory: [],
+    totalBackBought: 0, totalBackSold: 0, totalVirtualSpent: 0, totalVirtualRecovered: 0,
+  };
+}
+
+// Get VIRTUAL price in BACK from pair reserves (how much BACK per 1 VIRTUAL)
+let _pairToken0 = null; // cache token0 address
+async function getVirtualPriceInBack() {
+  const pair = new ethers.Contract(VIRTUAL_BACK_PAIR, PAIR_ABI, baseProvider);
+  if (!_pairToken0) _pairToken0 = (await pair.token0()).toLowerCase();
+  const [reserve0, reserve1] = await pair.getReserves();
+  const virtualIsToken0 = _pairToken0 === VIRTUAL_TOKEN.toLowerCase();
+  const virtualReserve = virtualIsToken0 ? Number(reserve0) : Number(reserve1);
+  const backReserve = virtualIsToken0 ? Number(reserve1) : Number(reserve0);
+  return backReserve / virtualReserve; // BACK per VIRTUAL
+}
+
+async function runAccumulateCycle(chatId) {
+  const state = getState(chatId);
+  const cs = state.base;
+  const accum = cs.accum;
+
+  if (!accum || !accum.running) return;
+
+  accum.cycle++;
+  const label = `[${accum.cycle}]`;
+
+  try {
+    // ── Price check ──────────────────────────────────────────
+    const currentPrice = await getVirtualPriceInBack();
+    accum.priceHistory.push(currentPrice);
+
+    // Keep last N samples for rolling average
+    const MAX_HISTORY = 20;
+    if (accum.priceHistory.length > MAX_HISTORY) accum.priceHistory.shift();
+
+    const avg = accum.priceHistory.reduce((a, b) => a + b, 0) / accum.priceHistory.length;
+    const deviation = ((currentPrice - avg) / avg) * 100; // +% means VIRTUAL is strong
+
+    // Need at least 3 data points before trading (build baseline)
+    if (accum.priceHistory.length < 3) {
+      const nextDelay = Math.floor(randomBetween(accum.minDelay, accum.maxDelay));
+      await bot.api.sendMessage(chatId,
+        `${label} SCAN price=${currentPrice.toFixed(4)} BACK/VIRTUAL | building baseline (${accum.priceHistory.length}/3)...`
+      );
+      if (accum.running) setTimeout(() => runAccumulateCycle(chatId), nextDelay * 1000);
+      return;
+    }
+
+    const threshold = accum.threshold; // e.g. 2 means ±2%
+
+    // ── VIRTUAL is UP → buy BACK (good rate) ────────────────
+    if (deviation >= threshold) {
+      const virtualContract = new ethers.Contract(VIRTUAL_TOKEN, ERC20_ABI, baseProvider);
+      const virtualBal = await virtualContract.balanceOf(cs.wallet.address);
+
+      if (virtualBal === 0n) {
+        await bot.api.sendMessage(chatId, `${label} No VIRTUAL balance — waiting for reload signal.`);
+      } else {
+        // Randomize buy amount
+        const minFloat = Number(ethers.formatUnits(accum.minAmount, 18));
+        const maxFloat = Number(ethers.formatUnits(accum.maxAmount, 18));
+        const randomAmt = randomBetween(minFloat, maxFloat);
+        let buyAmount = ethers.parseUnits(randomAmt.toFixed(6), 18);
+        if (buyAmount > virtualBal) buyAmount = virtualBal;
+
+        let buyResult;
+        for (let i = 1; i <= MAX_RETRIES; i++) {
+          try { buyResult = await baseSwapTokenToToken(cs.wallet, VIRTUAL_TOKEN, BACK_TOKEN, buyAmount, accum.slippage); break; }
+          catch (e) { if (i === MAX_RETRIES) throw e; await sleep(3000); }
+        }
+
+        const virtualSpent = Number(ethers.formatUnits(buyAmount, 18)).toFixed(4);
+        const backReceived = Number(ethers.formatUnits(buyResult.amountOut, 18)).toFixed(2);
+        accum.totalBackBought += Number(backReceived);
+        accum.totalVirtualSpent += Number(virtualSpent);
+        accum.trades++;
+
+        await bot.api.sendMessage(chatId,
+          `${label} BUY ${virtualSpent} VIRTUAL -> ${backReceived} BACK\nprice=${currentPrice.toFixed(4)} avg=${avg.toFixed(4)} dev=+${deviation.toFixed(1)}%\nTx: ${fmt.txBase(buyResult.hash)}`,
+          { parse_mode: 'Markdown', disable_web_page_preview: true }
+        );
+      }
+
+    // ── VIRTUAL is DOWN → reload VIRTUAL (it's cheap) ───────
+    } else if (deviation <= -threshold) {
+      const backContract = new ethers.Contract(BACK_TOKEN, ERC20_ABI, baseProvider);
+      const backBal = await backContract.balanceOf(cs.wallet.address);
+      const recycleAmount = backBal * BigInt(accum.recyclePercent) / 100n;
+
+      if (recycleAmount === 0n || backBal === 0n) {
+        await bot.api.sendMessage(chatId, `${label} No BACK to reload with — waiting for buy signal.`);
+      } else {
+        let sellResult;
+        for (let i = 1; i <= MAX_RETRIES; i++) {
+          try { sellResult = await baseSwapTokenToToken(cs.wallet, BACK_TOKEN, VIRTUAL_TOKEN, recycleAmount, accum.slippage); break; }
+          catch (e) { if (i === MAX_RETRIES) throw e; await sleep(3000); }
+        }
+
+        const backSold = Number(ethers.formatUnits(recycleAmount, 18)).toFixed(2);
+        const virtualRecovered = Number(ethers.formatUnits(sellResult.amountOut, 18)).toFixed(4);
+        accum.totalBackSold += Number(backSold);
+        accum.totalVirtualRecovered += Number(virtualRecovered);
+        accum.trades++;
+
+        await bot.api.sendMessage(chatId,
+          `${label} RELOAD ${backSold} BACK -> ${virtualRecovered} VIRTUAL\nprice=${currentPrice.toFixed(4)} avg=${avg.toFixed(4)} dev=${deviation.toFixed(1)}%\nTx: ${fmt.txBase(sellResult.hash)}`,
+          { parse_mode: 'Markdown', disable_web_page_preview: true }
+        );
+      }
+
+    // ── FLAT → skip ─────────────────────────────────────────
+    } else {
+      accum.skips++;
+      // Only notify every 5th skip to avoid spam
+      if (accum.skips % 5 === 0) {
+        await bot.api.sendMessage(chatId,
+          `${label} SKIP (${accum.skips} total) | price=${currentPrice.toFixed(4)} avg=${avg.toFixed(4)} dev=${deviation.toFixed(1)}% | threshold=±${threshold}%`
+        );
+      }
+    }
+
+    // ── Schedule next cycle ─────────────────────────────────
+    const nextDelay = Math.floor(randomBetween(accum.minDelay, accum.maxDelay));
+    if (accum.running) {
+      setTimeout(() => runAccumulateCycle(chatId), nextDelay * 1000);
+    }
+
+  } catch (error) {
+    // Don't stop on transient errors — retry next cycle
+    const nextDelay = Math.floor(randomBetween(accum.minDelay, accum.maxDelay));
+    await bot.api.sendMessage(chatId, `${label} Error: ${error.message}\nRetrying in ${nextDelay}s...`);
+    if (accum.running) {
+      setTimeout(() => runAccumulateCycle(chatId), nextDelay * 1000);
+    }
+  }
+}
+
+async function startAccumulate(chatId) {
+  const state = getState(chatId);
+  const cs = state.base;
+  if (!cs.wallet) return 'No wallet connected.';
+  if (!state.riskAccepted) return '__SHOW_RISK__';
+  if (cs.accum && cs.accum.running) return 'Already running.';
+
+  // Check ETH for gas
+  const ethBal = await baseProvider.getBalance(cs.wallet.address);
+  if (ethBal < ethers.parseEther('0.001')) return 'Need ETH for gas.';
+
+  // Check VIRTUAL balance
+  const virtualContract = new ethers.Contract(VIRTUAL_TOKEN, ERC20_ABI, baseProvider);
+  const virtualBal = await virtualContract.balanceOf(cs.wallet.address);
+
+  // Check BACK balance
+  const backContract = new ethers.Contract(BACK_TOKEN, ERC20_ABI, baseProvider);
+  const backBal = await backContract.balanceOf(cs.wallet.address);
+
+  if (virtualBal === 0n && backBal === 0n) return 'Need VIRTUAL or BACK balance to start.';
+
+  if (!cs.accum) {
+    cs.accum = defaultAccumState();
+  }
+
+  cs.accum.running = true;
+  cs.accum.cycle = 0;
+  cs.accum.trades = 0;
+  cs.accum.skips = 0;
+  cs.accum.priceHistory = [];
+  cs.accum.totalBackBought = 0;
+  cs.accum.totalBackSold = 0;
+  cs.accum.totalVirtualSpent = 0;
+  cs.accum.totalVirtualRecovered = 0;
+
+  // Get initial price
+  const price = await getVirtualPriceInBack();
+
+  runAccumulateCycle(chatId);
+
+  const vBal = Number(ethers.formatUnits(virtualBal, 18)).toFixed(2);
+  const bBal = Number(ethers.formatUnits(backBal, 18)).toFixed(2);
+  return fmt.header('ACCUMULATE STARTED') + '\n' +
+    fmt.line('Strategy', 'Price-reactive BACK accumulation') + '\n' +
+    fmt.line('Current Price', `${price.toFixed(4)} BACK/VIRTUAL`) + '\n' +
+    fmt.line('Buy Range', `${ethers.formatUnits(cs.accum.minAmount, 18)}-${ethers.formatUnits(cs.accum.maxAmount, 18)} VIRTUAL`) + '\n' +
+    fmt.line('Threshold', `±${cs.accum.threshold}%`) + '\n' +
+    fmt.line('Check Every', `${cs.accum.minDelay}-${cs.accum.maxDelay}s`) + '\n' +
+    fmt.line('Reload %', `${cs.accum.recyclePercent}%`) + '\n' +
+    fmt.line('VIRTUAL Bal', vBal) + '\n' +
+    fmt.line('BACK Bal', bBal) + '\n' + fmt.div() + '\n' +
+    'Building price baseline (3 checks), then trading starts.';
+}
+
+function stopAccumulate(chatId) {
+  const state = getState(chatId);
+  const cs = state.base;
+  if (!cs.accum || !cs.accum.running) return 'Not running.';
+  cs.accum.running = false;
+  const netBack = (cs.accum.totalBackBought - cs.accum.totalBackSold).toFixed(2);
+  const netVirtual = (cs.accum.totalVirtualRecovered - cs.accum.totalVirtualSpent).toFixed(4);
+  return fmt.header('ACCUMULATE STOPPED') + '\n' +
+    fmt.line('Cycles', cs.accum.cycle) + '\n' +
+    fmt.line('Trades', cs.accum.trades) + '\n' +
+    fmt.line('Skips', cs.accum.skips) + '\n' +
+    fmt.line('BACK Bought', cs.accum.totalBackBought.toFixed(2)) + '\n' +
+    fmt.line('BACK Sold', cs.accum.totalBackSold.toFixed(2)) + '\n' +
+    fmt.line('Net BACK', netBack) + '\n' +
+    fmt.line('VIRTUAL Spent', cs.accum.totalVirtualSpent.toFixed(4)) + '\n' +
+    fmt.line('VIRTUAL Recovered', cs.accum.totalVirtualRecovered.toFixed(4)) + '\n' +
+    fmt.line('Net VIRTUAL', netVirtual) + '\n' + fmt.div();
+}
+
+function accumSettingsKeyboard(accum) {
+  if (!accum) {
+    return new InlineKeyboard()
+      .text('Start Accumulate', 'start_accum').row()
+      .text('Back', 'main_menu');
+  }
+  const minA = Number(ethers.formatUnits(accum.minAmount, 18)).toFixed(1);
+  const maxA = Number(ethers.formatUnits(accum.maxAmount, 18)).toFixed(1);
+  return new InlineKeyboard()
+    .text(`Buy: ${minA}-${maxA} VIRTUAL`, 'accum_set_amount').row()
+    .text(`Check: ${accum.minDelay}-${accum.maxDelay}s`, 'accum_set_delay')
+    .text(`Threshold: ±${accum.threshold}%`, 'accum_set_threshold').row()
+    .text(`Reload: ${accum.recyclePercent}%`, 'accum_set_recycle')
+    .text(`Slippage: ${accum.slippage}%`, 'accum_set_slippage').row()
+    .text('Back', 'main_menu');
 }
 
 // Get ETH price in USDC
@@ -1389,6 +1663,7 @@ function modeKeyboard(chain) {
     .text('Volume Bot', 'mode_volume')
     .text('Grid Trade', 'mode_grid');
   if (chain === 'base') kb.text('Arb Bot', 'mode_arb');
+  if (chain === 'base') kb.row().text('Accumulate BACK', 'mode_accumulate');
   kb.row().text('Verify BACK', 'verify_back');
   return kb;
 }
@@ -1404,6 +1679,9 @@ function mainKeyboard(mode) {
   } else if (mode === 'arb') {
     kb.text('Start Arb', 'start_arb').text('Stop Arb', 'stop_arb').row();
     kb.text('Arb Status', 'arb_status').row();
+  } else if (mode === 'accumulate') {
+    kb.text('Start Accum', 'start_accum').text('Stop Accum', 'stop_accum').row();
+    kb.text('Accum Status', 'accum_status').row();
   }
   kb.text('Status', 'status').text('Refresh', 'refresh').row();
   kb.text('Switch Mode', 'switch_mode').text('Switch Chain', 'switch_chain');
@@ -1674,8 +1952,93 @@ bot.on('callback_query:data', async (ctx) => {
       await editOrReply(ctx, msg3, mainKeyboard('arb'));
       break;
     }
+    case 'mode_accumulate': {
+      if (state.chain !== 'base') {
+        await ctx.answerCallbackQuery({ text: 'Accumulate is Base-only.', show_alert: true });
+        break;
+      }
+      state.mode = 'accumulate';
+      state.chain = 'base';
+      const msg4 = await buildMainMsg(chatId);
+      await editOrReply(ctx, msg4, mainKeyboard('accumulate'));
+      break;
+    }
+    case 'start_accum': {
+      const response = await startAccumulate(chatId);
+      if (response === '__SHOW_RISK__') {
+        state._pendingAction = 'start_accum';
+        await editOrReply(ctx, fmt.header('RISK DISCLAIMER') + '\n\nTrading involves risk. You may lose funds.\nSlippage, failed txns, and price impact can reduce value.\n\nAccept to continue.', new InlineKeyboard().text('Accept Risk', 'accept_risk').text('Cancel', 'main_menu'));
+      } else {
+        await send(chatId, response, mainKeyboard('accumulate'));
+      }
+      break;
+    }
+    case 'stop_accum': {
+      const stopMsg = stopAccumulate(chatId);
+      await editOrReply(ctx, stopMsg, mainKeyboard('accumulate'));
+      break;
+    }
+    case 'accum_status': {
+      const cs5 = state.base;
+      const a = cs5.accum;
+      if (!a) { await editOrReply(ctx, 'No accumulate session.', mainKeyboard('accumulate')); break; }
+      const netBack = (a.totalBackBought - a.totalBackSold).toFixed(2);
+      const netVirtual = ((a.totalVirtualRecovered || 0) - a.totalVirtualSpent).toFixed(4);
+      const lastPrice = a.priceHistory && a.priceHistory.length > 0 ? a.priceHistory[a.priceHistory.length - 1].toFixed(4) : 'n/a';
+      const avg = a.priceHistory && a.priceHistory.length > 0
+        ? (a.priceHistory.reduce((x, y) => x + y, 0) / a.priceHistory.length).toFixed(4) : 'n/a';
+      const statusMsg = fmt.header('ACCUMULATE STATUS') + '\n' +
+        fmt.line('Running', a.running ? 'YES' : 'NO') + '\n' +
+        fmt.line('Cycles', a.cycle) + '\n' +
+        fmt.line('Trades', a.trades || 0) + '\n' +
+        fmt.line('Skips', a.skips || 0) + '\n' +
+        fmt.line('Price', `${lastPrice} BACK/VIRTUAL`) + '\n' +
+        fmt.line('Avg', `${avg} BACK/VIRTUAL`) + '\n' +
+        fmt.div() + '\n' +
+        fmt.line('BACK Bought', a.totalBackBought.toFixed(2)) + '\n' +
+        fmt.line('BACK Sold', a.totalBackSold.toFixed(2)) + '\n' +
+        fmt.line('Net BACK', netBack) + '\n' +
+        fmt.line('VIRTUAL Spent', a.totalVirtualSpent.toFixed(4)) + '\n' +
+        fmt.line('VIRTUAL Recovered', (a.totalVirtualRecovered || 0).toFixed(4)) + '\n' +
+        fmt.line('Net VIRTUAL', netVirtual) + '\n' + fmt.div();
+      await editOrReply(ctx, statusMsg, mainKeyboard('accumulate'));
+      break;
+    }
+    case 'accum_settings': {
+      const cs6 = state.base;
+      if (!cs6.accum) {
+        cs6.accum = defaultAccumState();
+      }
+      await editOrReply(ctx, fmt.header('ACCUMULATE SETTINGS'), accumSettingsKeyboard(cs6.accum));
+      break;
+    }
+    case 'accum_set_amount': {
+      state.waiting_for = 'accum_amount';
+      await send(chatId, 'Enter buy range (min-max VIRTUAL per trade).\nExample: 1-5');
+      break;
+    }
+    case 'accum_set_delay': {
+      state.waiting_for = 'accum_delay';
+      await send(chatId, 'Enter price check interval (min-max seconds).\nExample: 120-300');
+      break;
+    }
+    case 'accum_set_threshold': {
+      state.waiting_for = 'accum_threshold';
+      await send(chatId, 'Enter price deviation threshold (%).\nBuy BACK when VIRTUAL is up this %, reload when down.\nExample: 2');
+      break;
+    }
+    case 'accum_set_recycle': {
+      state.waiting_for = 'accum_recycle';
+      await send(chatId, 'Enter reload % (amount of BACK sold to reload VIRTUAL when price dips).\nExample: 15');
+      break;
+    }
+    case 'accum_set_slippage': {
+      state.waiting_for = 'accum_slippage';
+      await send(chatId, 'Enter slippage % for swaps.\nExample: 20');
+      break;
+    }
     case 'switch_mode': {
-      await editOrReply(ctx, fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles\nGrid: Spread trading\nArb: Cross-DEX arbitrage (Base)', modeKeyboard(state.chain));
+      await editOrReply(ctx, fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles\nGrid: Spread trading\nArb: Cross-DEX arbitrage (Base)\nAccumulate: Price-reactive BACK accumulation', modeKeyboard(state.chain));
       break;
     }
 
@@ -1726,7 +2089,10 @@ bot.on('callback_query:data', async (ctx) => {
 
     case 'settings_menu': {
       const cs = chainState(chatId);
-      if (state.mode === 'arb') {
+      if (state.mode === 'accumulate') {
+        if (!cs.accum) cs.accum = defaultAccumState();
+        await editOrReply(ctx, fmt.header('ACCUMULATE SETTINGS'), accumSettingsKeyboard(cs.accum));
+      } else if (state.mode === 'arb') {
         await editOrReply(ctx, fmt.header('ARB SETTINGS'), arbSettingsKeyboard(cs.arb));
       } else if (state.mode === 'grid') {
         await editOrReply(ctx, fmt.header('GRID SETTINGS'), gridSettingsKeyboard(cs.grid));
@@ -2016,6 +2382,9 @@ bot.on('callback_query:data', async (ctx) => {
       } else if (pending === 'start_arb') {
         const resp = await startArb(chatId, username);
         await send(chatId, resp, mainKeyboard('arb'));
+      } else if (pending === 'start_accum') {
+        const resp = await startAccumulate(chatId);
+        await send(chatId, resp, mainKeyboard('accumulate'));
       } else {
         await editOrReply(ctx, 'Risks accepted. You can now start trading.', mainKeyboard(state.mode || 'volume'));
       }
@@ -2166,6 +2535,80 @@ bot.on('message:text', async (ctx) => {
       await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
       const d = chain === 'base' ? cs.slippage + '%' : (cs.slippage / 100) + '%';
       await send(chatId, `Slippage: ${d}`, volumeSettingsKeyboard(cs, chain));
+      break;
+    }
+
+    // ---- Accumulate Settings Input ----
+    case 'accum_amount': {
+      try {
+        const parts = text.trim().split('-');
+        if (parts.length !== 2) throw new Error('Format: min-max (e.g. 1-5)');
+        const min = parseFloat(parts[0]);
+        const max = parseFloat(parts[1]);
+        if (isNaN(min) || isNaN(max) || min <= 0 || max <= min) throw new Error('Need positive numbers, max > min');
+        const cs = chainState(chatId);
+        if (!cs.accum) cs.accum = defaultAccumState();
+        cs.accum.minAmount = ethers.parseUnits(parts[0].trim(), 18);
+        cs.accum.maxAmount = ethers.parseUnits(parts[1].trim(), 18);
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId, `Buy range: ${min}-${max} VIRTUAL per trade`, accumSettingsKeyboard(cs.accum));
+      } catch (e) {
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId, 'Invalid: ' + e.message + '\nFormat: min-max (e.g. 1-5)');
+      }
+      break;
+    }
+
+    case 'accum_delay': {
+      try {
+        const parts = text.trim().split('-');
+        if (parts.length !== 2) throw new Error('Format: min-max (e.g. 120-300)');
+        const min = parseInt(parts[0]);
+        const max = parseInt(parts[1]);
+        if (isNaN(min) || isNaN(max) || min < 10 || max <= min) throw new Error('Need positive integers, max > min, min >= 10');
+        const cs = chainState(chatId);
+        if (!cs.accum) cs.accum = defaultAccumState();
+        cs.accum.minDelay = min;
+        cs.accum.maxDelay = max;
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId, `Check interval: ${min}-${max}s`, accumSettingsKeyboard(cs.accum));
+      } catch (e) {
+        await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+        await send(chatId, 'Invalid: ' + e.message + '\nFormat: min-max seconds (e.g. 120-300)');
+      }
+      break;
+    }
+
+    case 'accum_threshold': {
+      const n = parseFloat(text.trim());
+      if (isNaN(n) || n < 0.1 || n > 50) { await ctx.reply('Enter 0.1-50.'); break; }
+      const cs = chainState(chatId);
+      if (!cs.accum) cs.accum = defaultAccumState();
+      cs.accum.threshold = n;
+      await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+      await send(chatId, `Threshold: ±${n}%`, accumSettingsKeyboard(cs.accum));
+      break;
+    }
+
+    case 'accum_recycle': {
+      const n = parseFloat(text.trim());
+      if (isNaN(n) || n < 0 || n > 100) { await ctx.reply('Enter 0-100.'); break; }
+      const cs = chainState(chatId);
+      if (!cs.accum) cs.accum = defaultAccumState();
+      cs.accum.recyclePercent = n;
+      await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+      await send(chatId, `Reload: ${n}%`, accumSettingsKeyboard(cs.accum));
+      break;
+    }
+
+    case 'accum_slippage': {
+      const n = parseFloat(text.trim());
+      if (isNaN(n) || n < 0.1 || n > 100) { await ctx.reply('Enter 0.1-100.'); break; }
+      const cs = chainState(chatId);
+      if (!cs.accum) cs.accum = defaultAccumState();
+      cs.accum.slippage = Math.round(n);
+      await safeDelete(chatId, msgId); await safeDelete(chatId, state.promptMsgId);
+      await send(chatId, `Slippage: ${n}%`, accumSettingsKeyboard(cs.accum));
       break;
     }
 
