@@ -1094,11 +1094,6 @@ async function startGrid(chatId, username) {
   if (!cs.grid) return 'Configure grid first via Grid Settings.';
   if (!state.riskAccepted) return '__SHOW_RISK__';
 
-  // Token gate check for grid
-  if (!isWhitelisted(username) && !isVerified(state)) {
-    return `Grid requires BACK token verification.\n\n` +
-      `Hold ${BACK_GATE_AMOUNT.toLocaleString()} BACK and verify via "Switch Mode" > "Verify BACK".`;
-  }
 
   cs.grid.running = true;
   cs.grid.startTime = Date.now();
@@ -1450,12 +1445,6 @@ async function startArb(chatId, username) {
   if (!cs.wallet) return 'No wallet. Go to Wallet menu.';
   if (!state.riskAccepted) return '__SHOW_RISK__';
 
-  // Token gate check
-  if (!isWhitelisted(username) && !isVerified(state)) {
-    return 'Arb requires BACK token verification.\n\n' +
-      `Hold ${BACK_GATE_AMOUNT.toLocaleString()} BACK in your main wallet and verify via the Verify button.\n\n` +
-      'Use "Switch Mode" > "Verify BACK" to verify your holdings.';
-  }
 
   if (!cs.arb) cs.arb = createArbState();
 
@@ -1624,7 +1613,7 @@ async function startVolume(chatId, username) {
   if (!cs.token) return 'No token set.';
   if (!state.riskAccepted) return '__SHOW_RISK__';
 
-  const needsFee = !isWhitelisted(username) && cs.feePaidFor !== cs.token;
+  const needsFee = false; // Fee disabled — whitelist only for now
   if (needsFee) {
     try {
       if (state.chain === 'base') await basePayFee(cs.wallet);
@@ -1664,7 +1653,7 @@ function modeKeyboard(chain) {
     .text('Grid Trade', 'mode_grid').row()
     .text('Arb Bot', 'mode_arb').row()
     .text('Accumulate BACK', 'mode_accumulate').row()
-    .text('Verify BACK Holdings', 'verify_back');
+    .text('Switch Chain', 'switch_chain');
   return kb;
 }
 
@@ -1674,9 +1663,7 @@ function modeDescription(chain) {
     '*Volume Bot*\nAutomated buy/sell cycles to generate token volume. Set your token, amount, and interval — the bot handles the rest.\n\n' +
     '*Grid Trade*\nSpread trading on ETH/USDC or SOL/USDC. Places buy orders below price and sell orders above. Profits from each completed spread.\n\n' +
     '*Arb Bot* _(Base only)_\nCross-DEX arbitrage across Uniswap, Aerodrome, BaseSwap & SushiSwap. Scans for price spreads and executes profitable trades.\n\n' +
-    '*Accumulate BACK* _(Base only)_\nPrice-reactive $BACK token accumulation. Buys more when price dips, less when rising.\n\n' +
-    fmt.div() + '\n' +
-    `Grid & Arb require ${BACK_GATE_AMOUNT.toLocaleString()} $BACK holdings.`;
+    '*Accumulate BACK* _(Base only)_\nPrice-reactive $BACK token accumulation. Buys more when price dips, less when rising.';
   return text;
 }
 
