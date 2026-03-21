@@ -2859,5 +2859,14 @@ bot.on('message:text', async (ctx) => {
 // Start
 // ============================================================
 console.log('Silverback Bot starting (Volume + Grid + Arb | Base + Solana)...');
+
+// Register command menu in Telegram
+bot.api.setMyCommands([
+  { command: 'start', description: 'Main menu — select chain & mode' },
+  { command: 'status', description: 'View current status & positions' },
+  { command: 'stop', description: 'Stop all active operations' },
+  { command: 'help', description: 'How to use Silverback Bot' },
+]).catch(e => console.warn('Failed to set commands:', e.message));
+
 bot.start();
 console.log('Bot is live.');
