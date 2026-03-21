@@ -1660,12 +1660,24 @@ function chainKeyboard() {
 
 function modeKeyboard(chain) {
   const kb = new InlineKeyboard()
-    .text('Volume Bot', 'mode_volume')
-    .text('Grid Trade', 'mode_grid');
-  if (chain === 'base') kb.text('Arb Bot', 'mode_arb');
-  if (chain === 'base') kb.row().text('Accumulate BACK', 'mode_accumulate');
-  kb.row().text('Verify BACK', 'verify_back');
+    .text('Volume Bot', 'mode_volume').row()
+    .text('Grid Trade', 'mode_grid').row()
+    .text('Arb Bot', 'mode_arb').row()
+    .text('Accumulate BACK', 'mode_accumulate').row()
+    .text('Verify BACK Holdings', 'verify_back');
   return kb;
+}
+
+function modeDescription(chain) {
+  const chainLabel = chain === 'base' ? 'Base' : 'Solana';
+  let text = fmt.header('SELECT MODE') + `\nChain: ${chainLabel}\n\n` +
+    '*Volume Bot*\nAutomated buy/sell cycles to generate token volume. Set your token, amount, and interval — the bot handles the rest.\n\n' +
+    '*Grid Trade*\nSpread trading on ETH/USDC or SOL/USDC. Places buy orders below price and sell orders above. Profits from each completed spread.\n\n' +
+    '*Arb Bot* _(Base only)_\nCross-DEX arbitrage across Uniswap, Aerodrome, BaseSwap & SushiSwap. Scans for price spreads and executes profitable trades.\n\n' +
+    '*Accumulate BACK* _(Base only)_\nPrice-reactive $BACK token accumulation. Buys more when price dips, less when rising.\n\n' +
+    fmt.div() + '\n' +
+    `Grid & Arb require ${BACK_GATE_AMOUNT.toLocaleString()} $BACK holdings.`;
+  return text;
 }
 
 function mainKeyboard(mode) {
@@ -1842,7 +1854,7 @@ bot.command('start', async (ctx) => {
   if (!state.chain) {
     await ctx.reply(fmt.header('SILVERBACK BOT') + '\n\nSelect chain:', { parse_mode: 'Markdown', reply_markup: chainKeyboard() });
   } else if (!state.mode) {
-    await ctx.reply(fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles for volume\nGrid: Automated spread trading\nArb: Cross-DEX arbitrage (Base only)', { parse_mode: 'Markdown', reply_markup: modeKeyboard(state.chain) });
+    await ctx.reply(modeDescription(state.chain), { parse_mode: 'Markdown', reply_markup: modeKeyboard(state.chain) });
   } else {
     const msg = await buildMainMsg(ctx.chat.id);
     await ctx.reply(msg, { parse_mode: 'Markdown', disable_web_page_preview: true, reply_markup: mainKeyboard(state.mode) });
@@ -1907,7 +1919,7 @@ bot.on('callback_query:data', async (ctx) => {
     case 'chain_base': {
       state.chain = 'base';
       if (!state.mode) {
-        await editOrReply(ctx, fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles\nGrid: Spread trading\nArb: Cross-DEX arbitrage (Base)', modeKeyboard('base'));
+        await editOrReply(ctx, modeDescription('base'), modeKeyboard('base'));
       } else {
         const msg = await buildMainMsg(chatId);
         await editOrReply(ctx, msg, mainKeyboard(state.mode));
@@ -1916,9 +1928,8 @@ bot.on('callback_query:data', async (ctx) => {
     }
     case 'chain_solana': {
       state.chain = 'solana';
-      if (state.mode === 'arb') state.mode = null; // arb is Base-only
       if (!state.mode) {
-        await editOrReply(ctx, fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles\nGrid: Spread trading', modeKeyboard('solana'));
+        await editOrReply(ctx, modeDescription('solana'), modeKeyboard('solana'));
       } else {
         const msg = await buildMainMsg(chatId);
         await editOrReply(ctx, msg, mainKeyboard(state.mode));
@@ -1943,7 +1954,7 @@ bot.on('callback_query:data', async (ctx) => {
     }
     case 'mode_arb': {
       if (state.chain !== 'base') {
-        await ctx.answerCallbackQuery({ text: 'Arb is Base-only.', show_alert: true });
+        await ctx.answerCallbackQuery({ text: 'Arb is currently Base-only. Switch to Base chain to use this mode.', show_alert: true });
         break;
       }
       state.mode = 'arb';
@@ -1954,7 +1965,7 @@ bot.on('callback_query:data', async (ctx) => {
     }
     case 'mode_accumulate': {
       if (state.chain !== 'base') {
-        await ctx.answerCallbackQuery({ text: 'Accumulate is Base-only.', show_alert: true });
+        await ctx.answerCallbackQuery({ text: 'Accumulate is currently Base-only. Switch to Base chain to use this mode.', show_alert: true });
         break;
       }
       state.mode = 'accumulate';
@@ -2038,7 +2049,7 @@ bot.on('callback_query:data', async (ctx) => {
       break;
     }
     case 'switch_mode': {
-      await editOrReply(ctx, fmt.header('SELECT MODE') + '\n\nVolume: Buy-sell cycles\nGrid: Spread trading\nArb: Cross-DEX arbitrage (Base)\nAccumulate: Price-reactive BACK accumulation', modeKeyboard(state.chain));
+      await editOrReply(ctx, modeDescription(state.chain), modeKeyboard(state.chain));
       break;
     }
 
