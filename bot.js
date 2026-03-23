@@ -1752,7 +1752,7 @@ async function buildMainMsg(chatId) {
   const cs = state[chain];
   const mode = state.mode;
   const chainName = chain === 'base' ? 'Base' : 'Solana';
-  const modeName = mode === 'grid' ? 'Grid Trade' : 'Volume';
+  const modeName = mode === 'grid' ? 'Grid Trade' : mode === 'arb' ? 'Arbitrage' : mode === 'accumulate' ? 'Accumulate' : 'Volume';
 
   let msg = fmt.header('SILVERBACK BOT') + '\n\n';
   msg += fmt.line('Chain', chainName) + '\n';
@@ -1784,6 +1784,15 @@ async function buildMainMsg(chatId) {
         msg += fmt.div() + '\n';
         msg += `Arb running: ${cs.arb.tradesCompleted} trades, P&L: ${cs.arb.totalProfit >= 0 ? '+' : ''}${cs.arb.totalProfit.toFixed(6)} ETH\n`;
         msg += `Scans: ${cs.arb.scansCompleted} | Opportunities: ${cs.arb.opportunitiesFound}`;
+      }
+    }
+
+    if (mode === 'accumulate') {
+      if (cs.accum && cs.accum.running) {
+        msg += fmt.div() + '\n';
+        const netBack = (cs.accum.totalBackBought - cs.accum.totalBackSold).toFixed(2);
+        msg += `Accumulate running: ${cs.accum.trades} trades, Net BACK: ${netBack}\n`;
+        msg += `Cycles: ${cs.accum.cycle} | Skips: ${cs.accum.skips}`;
       }
     }
 
@@ -1853,6 +1862,7 @@ bot.command('stop', async (ctx) => {
   if (state.chain && state.mode === 'volume') stopVolume(ctx.chat.id);
   if (state.chain && state.mode === 'grid') stopGrid(ctx.chat.id);
   if (state.chain && state.mode === 'arb') stopArb(ctx.chat.id);
+  if (state.chain && state.mode === 'accumulate') stopAccumulate(ctx.chat.id);
   await ctx.reply('Stopped.');
 });
 
@@ -1882,12 +1892,8 @@ bot.command('help', async (ctx) => {
     'ARB MODE (Base only):\nCross-DEX arbitrage across Uniswap, Aerodrome,\n' +
     'BaseSwap & SushiSwap. Scans for price spreads\n' +
     'and executes profitable trades automatically.\n\n' +
-    fmt.div() + '\n' +
-    'TOKEN GATE (BACK):\n' +
-    `Volume: Free\n` +
-    `Grid & Arb: ${BACK_GATE_AMOUNT.toLocaleString()} BACK required\n\n` +
-    'Verify by signing a message with your BACK-holding\n' +
-    'wallet. Use "Verify BACK" in mode selection.',
+    'ACCUMULATE MODE (Base only):\nPrice-reactive BACK token accumulation.\n' +
+    'Buys dips and optionally recycles on pumps.',
     { parse_mode: 'Markdown' }
   );
 });
@@ -2043,7 +2049,7 @@ bot.on('callback_query:data', async (ctx) => {
     // ---- Navigation ----
     case 'main_menu': {
       if (!state.chain) { await editOrReply(ctx, 'Select chain:', chainKeyboard()); break; }
-      if (!state.mode) { await editOrReply(ctx, 'Select mode:', modeKeyboard()); break; }
+      if (!state.mode) { await editOrReply(ctx, modeDescription(state.chain), modeKeyboard(state.chain)); break; }
       const msg = await buildMainMsg(chatId);
       await editOrReply(ctx, msg, mainKeyboard(state.mode));
       break;
